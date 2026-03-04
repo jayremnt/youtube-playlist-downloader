@@ -2,17 +2,39 @@ import os
 import subprocess
 import sys
 import json
+import threading
+import concurrent.futures
 from pathlib import Path
 
 CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
+
+class PositionManager:
+    """Thread-safe manager to track and assign terminal rows for progress bars."""
+    def __init__(self, max_positions):
+        self.available_positions = list(range(max_positions))
+        self.lock = threading.Lock()
+
+    def get_position(self):
+        with self.lock:
+            if self.available_positions:
+                return self.available_positions.pop(0)
+            return 0  # Fallback if we run out of rows
+
+    def release_position(self, pos):
+        with self.lock:
+            self.available_positions.append(pos)
+            self.available_positions.sort()
+
+# Global positioning manager instance
+position_manager = None
 
 def load_config():
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: Failed to load config, using defaults. Error: {e}")
     return {
         "base_dir": str(Path.home() / "Videos"),
         "folder_name": "YouTube Downloads"
@@ -22,7 +44,7 @@ def save_config(config):
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
-    except Exception as e:
+    except OSError as e:
         print(f"Warning: Failed to save config: {e}")
 
 def ensure_virtualenv():
@@ -32,8 +54,11 @@ def ensure_virtualenv():
     
     # Create default requirements.txt if it doesn't exist
     if not requirements_file.exists():
-        with open(requirements_file, "w", encoding="utf-8") as f:
-            f.write("yt-dlp\ntqdm\nimageio-ffmpeg\n")
+        try:
+            with open(requirements_file, "w", encoding="utf-8") as f:
+                f.write("yt-dlp\ntqdm\nimageio-ffmpeg\n")
+        except OSError as e:
+            print(f"Warning: Could not write requirements.txt: {e}")
             
     venv_dir = Path.home() / ".yt_downloader_venv"
     
@@ -72,51 +97,68 @@ def ensure_virtualenv():
         sys.exit(1)
 
 def get_playlist_videos(url):
-    """Fetch all video URLs and titles from the playlist."""
+    """Fetch all video URLs and titles from the playlist using yt_dlp Python API."""
+    import yt_dlp
     print("Fetching playlist information...")
-    command = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--flat-playlist",
-        "--dump-json",
-        url
-    ]
+    
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
     
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        videos = []
-        # JSON output per line
-        import json
-        for index, line in enumerate(result.stdout.strip().split('\n'), start=1):
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                video_url = data.get('url', '')
-                if not video_url:
-                    video_url = f"https://www.youtube.com/watch?v={data.get('id', '')}"
-                videos.append((index, video_url))
-            except json.JSONDecodeError:
-                continue
-        return videos
-    except subprocess.CalledProcessError:
-        print("Failed to fetch playlist information.")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            videos = []
+            
+            if 'entries' in info:
+                # It's a playlist
+                for index, entry in enumerate(info['entries'], start=1):
+                    if not entry:
+                        continue
+                        
+                    video_url = entry.get('url')
+                    if not video_url and entry.get('id'):
+                        video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        
+                    if video_url:
+                        videos.append((index, video_url))
+            else:
+                # It's a single video
+                video_url = info.get('url')
+                if not video_url and info.get('id'):
+                    video_url = f"https://www.youtube.com/watch?v={info.get('id')}"
+                if video_url:
+                    videos.append((1, video_url))
+            
+            return videos
+            
+    except yt_dlp.utils.DownloadError as e:
+        print(f"Error fetching playlist: {e}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error fetching playlist information: {e}")
         return []
 
-def download_single_video(index, url, download_dir, pos):
+def download_single_video(index, url, download_dir):
     """Download a single video using the yt_dlp Python API with a tqdm progress bar."""
-    from tqdm import tqdm
     import yt_dlp
     import imageio_ffmpeg
+    import re
+    from tqdm import tqdm
 
-    # Initialize a progress bar for this specific thread
+    # Get an available position for the progress bar
+    pos = position_manager.get_position() if position_manager else 0
+
     pbar = tqdm(total=100, position=pos, leave=True, desc=f"Video {index:03d}", unit="%", bar_format='{desc}: {percentage:3.0f}%|{bar}| {remaining}')
 
     def progress_hook(d):
         if d['status'] == 'downloading':
             # Extract percentage from the string (e.g., " 45.2%")
             p_str = d.get('_percent_str', '0%').replace('%', '').strip()
+            # Remove ANSI color codes that yt-dlp sometimes adds
+            p_str = re.sub(r'\x1b\[[0-9;]*m', '', p_str)
             try:
                 p_val = float(p_str)
                 pbar.n = p_val
@@ -141,20 +183,31 @@ def download_single_video(index, url, download_dir, pos):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-    except Exception:
+    except yt_dlp.utils.DownloadError:
         pbar.set_description(f"Video {index:03d} (FAILED)")
+    except Exception:
+        # Catch other unexpected errors to prevent thread crashes
+        pbar.set_description(f"Video {index:03d} (ERROR)")
     finally:
         pbar.close()
+        # Release the terminal row for the next video
+        if position_manager:
+            position_manager.release_position(pos)
 
 def main():
     ensure_virtualenv()
+    
+    global position_manager
     
     print("=" * 50)
     print("           YouTube Playlist Downloader")
     print("=" * 50)
     print()
     
-    url = input("Please enter the YouTube playlist link: ").strip()
+    try:
+        url = input("Please enter the YouTube playlist link: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
     
     if not url:
         print("Error: No link provided. Exiting.")
@@ -165,14 +218,22 @@ def main():
     default_base_dir = config.get("base_dir", str(Path.home() / "Videos"))
     print(f"\n[Base Directory]")
     print(f"Default: {default_base_dir}")
-    user_base_dir = input("Enter new path (or press Enter to use default): ").strip()
+    try:
+        user_base_dir = input("Enter new path (or press Enter to use default): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+        
     base_dir_str = user_base_dir if user_base_dir else default_base_dir
     base_dir = Path(base_dir_str)
 
     default_folder_name = config.get("folder_name", "YouTube Downloads")
     print(f"\n[Playlist Folder Name]")
     print(f"Default: {default_folder_name}")
-    user_folder_name = input("Enter new name (or press Enter to use default): ").strip()
+    try:
+        user_folder_name = input("Enter new name (or press Enter to use default): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+        
     folder_name = user_folder_name if user_folder_name else default_folder_name
 
     # Save preferences for next time
@@ -184,7 +245,7 @@ def main():
     
     try:
         download_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
+    except OSError as e:
         print(f"Error creating directory {download_dir}: {e}")
         return
     
@@ -192,25 +253,26 @@ def main():
     
     if not videos:
         print("No videos found in the playlist or playlist is private.")
-        input("\nPress Enter to exit...")
+        try:
+            input("\nPress Enter to exit...")
+        except (EOFError, KeyboardInterrupt):
+            pass
         return
         
-    print(f"\nFound {len(videos)} videos. Starting parallel download with 8 threads to: {download_dir}")
+    max_workers = 8
+    print(f"\nFound {len(videos)} videos. Starting parallel download with {max_workers} threads to: {download_dir}")
     print("Please wait, this might take a while depending on the playlist size...\n")
     
-    import concurrent.futures
-    from tqdm import tqdm
+    position_manager = PositionManager(max_workers)
 
     # This prevents overlapping bars in some terminals
-    print("\n" * 8) 
+    print("\n" * max_workers) 
 
-    # Use ThreadPoolExecutor to run up to 8 downloads concurrently
-    # We pass the index of the thread (0-7) to position the progress bars
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    # Use ThreadPoolExecutor to run downloads concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for i, (index, v_url) in enumerate(videos):
-            # We use (i % 8) as the terminal line position for the bar
-            futures.append(executor.submit(download_single_video, index, v_url, download_dir, i % 8))
+        for index, v_url in videos:
+            futures.append(executor.submit(download_single_video, index, v_url, download_dir))
         
         # Wait for all futures to complete
         concurrent.futures.wait(futures)
@@ -220,7 +282,10 @@ def main():
     print(f"Files are saved in: {download_dir}")
     print("=" * 50)
     
-    input("\nPress Enter to exit...")
+    try:
+        input("\nPress Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 if __name__ == "__main__":
     main()
