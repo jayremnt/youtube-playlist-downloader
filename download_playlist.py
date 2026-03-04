@@ -37,7 +37,8 @@ def load_config():
             print(f"Warning: Failed to load config, using defaults. Error: {e}")
     return {
         "base_dir": str(Path.home() / "Videos"),
-        "folder_name": "YouTube Downloads"
+        "folder_name": "YouTube Downloads",
+        "cookie_method": "none"
     }
 
 def save_config(config):
@@ -96,7 +97,7 @@ def ensure_virtualenv():
     except KeyboardInterrupt:
         sys.exit(1)
 
-def get_playlist_videos(url):
+def get_playlist_videos(url, cookie_method=None):
     """Fetch all video URLs and titles from the playlist using yt_dlp Python API."""
     import yt_dlp
     print("Fetching playlist information...")
@@ -107,6 +108,13 @@ def get_playlist_videos(url):
         'no_warnings': True,
     }
     
+    if cookie_method:
+        # Check if the user provided a file path (cookies.txt) or a browser name
+        if Path(cookie_method).is_file():
+            ydl_opts['cookiefile'] = cookie_method
+        else:
+            ydl_opts['cookiesfrombrowser'] = (cookie_method,)
+        
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -135,13 +143,24 @@ def get_playlist_videos(url):
             return videos
             
     except yt_dlp.utils.DownloadError as e:
-        print(f"Error fetching playlist: {e}")
+        error_msg = str(e)
+        if "Could not copy Chrome cookie database" in error_msg:
+            print(f"\n[!] BROWSER LOCKED ERROR:")
+            print(f"    Your browser ({cookie_method}) is currently OPEN and locking the cookie file.")
+            print(f"    Please completely CLOSE the browser (and any background tabs) and run this script again.")
+            print(f"    Alternatively, use the 'cookies.txt' file method instead.\n")
+        elif "Failed to decrypt with DPAPI" in error_msg:
+            print(f"\n[!] WINDOWS ENCRYPTION ERROR:")
+            print(f"    Windows is blocking direct cookie extraction from your browser.")
+            print(f"    Please use the 'cookies.txt' file workaround described above instead.\n")
+        else:
+            print(f"Error fetching playlist: {e}")
         return []
     except Exception as e:
         print(f"Unexpected error fetching playlist information: {e}")
         return []
 
-def download_single_video(index, url, download_dir):
+def download_single_video(index, url, download_dir, cookie_method=None):
     """Download a single video using the yt_dlp Python API with a tqdm progress bar."""
     import yt_dlp
     import imageio_ffmpeg
@@ -179,6 +198,12 @@ def download_single_video(index, url, download_dir):
         'no_warnings': True,
         'nocheckcertificate': True,
     }
+
+    if cookie_method:
+        if Path(cookie_method).is_file():
+            ydl_opts['cookiefile'] = cookie_method
+        else:
+            ydl_opts['cookiesfrombrowser'] = (cookie_method,)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -236,9 +261,53 @@ def main():
         
     folder_name = user_folder_name if user_folder_name else default_folder_name
 
+    script_dir = Path(__file__).parent
+    local_cookies_file = script_dir / "cookies.txt"
+    
+    # Check if the file has actual content (beyond simple comments)
+    has_cookies = False
+    if local_cookies_file.exists():
+        try:
+            with open(local_cookies_file, "r", encoding="utf-8") as f:
+                content = f.read()
+                # A populated cookies.txt usually has a good amount of text and specific domains
+                if len(content.strip()) > 100 and ".youtube.com" in content:
+                    has_cookies = True
+        except OSError:
+            pass
+
+    if has_cookies:
+        print(f"\n[Cookies] Local 'cookies.txt' found and loaded automatically!")
+        print("Bypassing bot blocks using your exported cookies.")
+        cookie_method_str = "cookies.txt"
+        cookie_method = str(local_cookies_file)
+    else:
+        print(f"\n[Cookies] No cookies found in your local 'cookies.txt' file.")
+        print("To easily bypass YouTube's anti-bot blocks, we highly recommend exporting your cookies:")
+        print("1. Install this extension: https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc")
+        print("2. Go to youtube.com while logged in and click the extension to export.")
+        print("3. Open the file 'cookies.txt' in this folder and paste the contents inside.")
+        print("\nFalling back to direct browser extraction...")
+        
+        default_browser = config.get("cookie_method", "none")
+        # If their last saved default was cookies.txt or a path, reset it so we don't crash
+        if default_browser == "cookies.txt" or "\\" in default_browser or "/" in default_browser:
+            default_browser = "none"
+            
+        print(f"Default: {default_browser}")
+        print("Options: chrome, edge, firefox, brave, opera, vivaldi, safari, none")
+        try:
+            user_browser = input("Enter browser name (or press Enter to use default): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+            
+        cookie_method_str = user_browser if user_browser else default_browser
+        cookie_method = cookie_method_str if cookie_method_str != "none" else None
+
     # Save preferences for next time
     config["base_dir"] = str(base_dir)
     config["folder_name"] = folder_name
+    config["cookie_method"] = cookie_method_str
     save_config(config)
 
     download_dir = base_dir / folder_name
@@ -249,7 +318,7 @@ def main():
         print(f"Error creating directory {download_dir}: {e}")
         return
     
-    videos = get_playlist_videos(url)
+    videos = get_playlist_videos(url, cookie_method)
     
     if not videos:
         print("No videos found in the playlist or playlist is private.")
@@ -272,7 +341,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for index, v_url in videos:
-            futures.append(executor.submit(download_single_video, index, v_url, download_dir))
+            futures.append(executor.submit(download_single_video, index, v_url, download_dir, cookie_method))
         
         # Wait for all futures to complete
         concurrent.futures.wait(futures)

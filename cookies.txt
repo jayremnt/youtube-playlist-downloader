@@ -1,0 +1,5 @@
+# Netscape HTTP Cookie File
+# To avoid bot blocks, paste your exported YouTube cookies below this line.
+# You can use this extension to get them: 
+# https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+
