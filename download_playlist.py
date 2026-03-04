@@ -1,43 +1,75 @@
 import os
 import subprocess
 import sys
+import json
 from pathlib import Path
 
-def check_and_install_packages():
-    """Check if pip and yt-dlp are installed, otherwise attempt to install them."""
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except subprocess.CalledProcessError:
-        print("pip is not installed. Attempting to install it automatically...")
-        try:
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True)
-            print("pip installed successfully!\n")
-        except subprocess.CalledProcessError:
-            print("\nError: Failed to install pip automatically. Downloading get-pip.py...")
-            try:
-                import urllib.request
-                urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", "get-pip.py")
-                subprocess.run([sys.executable, "get-pip.py"], check=True)
-                os.remove("get-pip.py")
-                print("pip installed successfully!\n")
-            except Exception as e:
-                print(f"Error: {e}")
-                print("Please ensure you have an active internet connection or install pip manually.")
-                sys.exit(1)
+CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
 
-    try:
-        subprocess.run([sys.executable, "-m", "yt_dlp", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        # Also check for tqdm and imageio-ffmpeg
-        import tqdm
-        import imageio_ffmpeg
-    except (subprocess.CalledProcessError, ImportError):
-        print("Required packages (yt-dlp, tqdm, imageio-ffmpeg) are missing. Attempting to install them...")
+def load_config():
+    if CONFIG_FILE.exists():
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp", "tqdm", "imageio-ffmpeg"], check=True)
-            print("Packages installed successfully!\n")
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "base_dir": str(Path.home() / "Videos"),
+        "folder_name": "YouTube Downloads"
+    }
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        print(f"Warning: Failed to save config: {e}")
+
+def ensure_virtualenv():
+    """Ensure the script runs within an isolated virtual environment."""
+    script_dir = Path(__file__).parent
+    requirements_file = script_dir / "requirements.txt"
+    
+    # Create default requirements.txt if it doesn't exist
+    if not requirements_file.exists():
+        with open(requirements_file, "w", encoding="utf-8") as f:
+            f.write("yt-dlp\ntqdm\nimageio-ffmpeg\n")
+            
+    venv_dir = Path.home() / ".yt_downloader_venv"
+    
+    if os.name == 'nt':
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+        
+    # If we are already running inside the target venv, just return and execute the rest of the script
+    if sys.executable == str(venv_python):
+        return
+        
+    print(f"Setting up an isolated environment at: {venv_dir}")
+    
+    if not venv_python.exists():
+        print("Creating virtual environment... (This only happens once)")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
         except subprocess.CalledProcessError:
-            print("\nError: Failed to install required packages.")
+            print("Error: Failed to create virtual environment.")
             sys.exit(1)
+            
+    print(f"Checking and installing required packages from {requirements_file.name}...")
+    try:
+        subprocess.run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "-q"], check=True)
+        subprocess.run([str(venv_python), "-m", "pip", "install", "-q", "-r", str(requirements_file)], check=True)
+    except subprocess.CalledProcessError:
+        print("Error: Failed to install required packages.")
+        sys.exit(1)
+        
+    print("Environment ready! Launching downloader...\n")
+    try:
+        result = subprocess.run([str(venv_python), *sys.argv])
+        sys.exit(result.returncode)
+    except KeyboardInterrupt:
+        sys.exit(1)
 
 def get_playlist_videos(url):
     """Fetch all video URLs and titles from the playlist."""
@@ -115,7 +147,7 @@ def download_single_video(index, url, download_dir, pos):
         pbar.close()
 
 def main():
-    check_and_install_packages()
+    ensure_virtualenv()
     
     print("=" * 50)
     print("           YouTube Playlist Downloader")
@@ -128,9 +160,33 @@ def main():
         print("Error: No link provided. Exiting.")
         return
 
-    # Determine the download directory (Videos/YouTube Downloads)
-    download_dir = Path.home() / "Videos" / "YouTube Downloads"
-    download_dir.mkdir(parents=True, exist_ok=True)
+    config = load_config()
+
+    default_base_dir = config.get("base_dir", str(Path.home() / "Videos"))
+    print(f"\n[Base Directory]")
+    print(f"Default: {default_base_dir}")
+    user_base_dir = input("Enter new path (or press Enter to use default): ").strip()
+    base_dir_str = user_base_dir if user_base_dir else default_base_dir
+    base_dir = Path(base_dir_str)
+
+    default_folder_name = config.get("folder_name", "YouTube Downloads")
+    print(f"\n[Playlist Folder Name]")
+    print(f"Default: {default_folder_name}")
+    user_folder_name = input("Enter new name (or press Enter to use default): ").strip()
+    folder_name = user_folder_name if user_folder_name else default_folder_name
+
+    # Save preferences for next time
+    config["base_dir"] = str(base_dir)
+    config["folder_name"] = folder_name
+    save_config(config)
+
+    download_dir = base_dir / folder_name
+    
+    try:
+        download_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Error creating directory {download_dir}: {e}")
+        return
     
     videos = get_playlist_videos(url)
     
