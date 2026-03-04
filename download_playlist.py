@@ -189,7 +189,7 @@ def download_single_video(index, url, download_dir, cookie_method=None):
             pbar.refresh()
 
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
         'outtmpl': str(download_dir / f"{index:03d} - %(title)s.%(ext)s"),
         'merge_output_format': 'mp4',
         'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
